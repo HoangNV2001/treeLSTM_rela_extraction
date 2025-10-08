@@ -79,8 +79,22 @@ class RelationExtractionModel(nn.Module):
             
             num_tokens = len(tokens)
             
+            # FIX: Ensure tree_nodes is valid and not empty
+            if len(tree_nodes) == 0:
+                # Fallback: use e1 and e2 as tree nodes
+                tree_nodes = [e1_idx, e2_idx]
+            
             # Map tokens to PhoBERT tokens (approximate)
             token_features = phobert_features[b, 1:num_tokens+1, :]  # Skip [CLS]
+            
+            # Ensure we don't go out of bounds
+            if token_features.size(0) < num_tokens:
+                # Pad if necessary
+                padding = torch.zeros(num_tokens - token_features.size(0), 
+                                    self.phobert_dim, device=device)
+                token_features = torch.cat([token_features, padding], dim=0)
+            else:
+                token_features = token_features[:num_tokens]
             
             # Create embeddings for each token
             pos_ids = torch.tensor([hash(pos) % 50 for pos in pos_tags], device=device)
@@ -98,11 +112,14 @@ class RelationExtractionModel(nn.Module):
             
             # SDP position
             sdp_pos = torch.zeros(num_tokens, dtype=torch.long, device=device)
-            for idx in sdp:
-                if idx < len(sdp) // 2:
-                    sdp_pos[idx] = 1
-                else:
-                    sdp_pos[idx] = 2
+            if len(sdp) > 0:
+                sdp_mid = len(sdp) // 2
+                for i, idx in enumerate(sdp):
+                    if idx < num_tokens:  # Ensure valid index
+                        if i < sdp_mid:
+                            sdp_pos[idx] = 1
+                        else:
+                            sdp_pos[idx] = 2
             sdp_emb = self.sdp_embedding(sdp_pos)
             
             # Concatenate all features
@@ -125,19 +142,38 @@ class RelationExtractionModel(nn.Module):
             
             # Prepare Tree-LSTM input
             tree_features = []
+            valid_tree_nodes = []
             for node_idx in tree_nodes:
-                node_dep_emb = dep_emb[node_idx]
-                node_seq_features = seq_output[node_idx]
-                tree_input = torch.cat([node_seq_features, node_dep_emb], dim=-1)
-                tree_features.append(tree_input)
+                if node_idx < num_tokens:  # Ensure valid index
+                    node_dep_emb = dep_emb[node_idx]
+                    node_seq_features = seq_output[node_idx]
+                    tree_input = torch.cat([node_seq_features, node_dep_emb], dim=-1)
+                    tree_features.append(tree_input)
+                    valid_tree_nodes.append(node_idx)
+            
+            if len(tree_features) == 0:
+                # Fallback: use e1 and e2
+                tree_features = [
+                    torch.cat([seq_output[e1_idx], dep_emb[e1_idx]], dim=-1),
+                    torch.cat([seq_output[e2_idx], dep_emb[e2_idx]], dim=-1)
+                ]
+                valid_tree_nodes = [e1_idx, e2_idx]
             
             tree_features = torch.stack(tree_features)  # (num_tree_nodes, tree_input_dim)
             
-            # Find root of SDP (middle node)
-            root_idx = sdp[len(sdp) // 2] if len(sdp) > 0 else e1_idx
+            # Find root of SDP - ensure it's in valid_tree_nodes
+            root_idx = None
+            if len(sdp) > 0:
+                sdp_middle = sdp[len(sdp) // 2]
+                if sdp_middle in valid_tree_nodes:
+                    root_idx = sdp_middle
+            
+            if root_idx is None:
+                # Use first entity as root
+                root_idx = e1_idx if e1_idx in valid_tree_nodes else valid_tree_nodes[0]
             
             # Tree-LSTM forward
-            root_hidden, _ = self.tree_lstm(tree_features, dep_heads, tree_nodes, root_idx)
+            root_hidden, _ = self.tree_lstm(tree_features, dep_heads, valid_tree_nodes, root_idx)
             
             batch_outputs.append(root_hidden)
         

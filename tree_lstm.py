@@ -89,24 +89,36 @@ class TreeLSTM(nn.Module):
             all_hidden: dict mapping node_idx -> hidden state
         """
         num_nodes = len(tree_nodes)
+        
+        # FIX: Ensure tree_nodes is a list and has valid nodes
+        if num_nodes == 0:
+            # Return zero hidden state if no tree nodes
+            return torch.zeros(self.hidden_dim, device=node_features.device), {}
+        
+        tree_nodes_set = set(tree_nodes)
         node_map = {idx: i for i, idx in enumerate(tree_nodes)}
         
-        # Build children lists
+        # Build children lists - ONLY include children that are in tree_nodes
         children = {idx: [] for idx in tree_nodes}
         for node_idx in tree_nodes:
             parent_idx = dep_heads[node_idx]
-            if parent_idx in node_map and parent_idx != node_idx:
+            # Only add edge if both parent and child are in tree
+            if parent_idx in tree_nodes_set and parent_idx != node_idx:
                 children[parent_idx].append(node_idx)
         
         # Find root if not provided
-        if root_idx is None:
+        if root_idx is None or root_idx not in tree_nodes_set:
             # Root is node with no parent in tree or parent outside tree
+            root_candidates = []
             for node_idx in tree_nodes:
                 parent_idx = dep_heads[node_idx]
-                if parent_idx not in node_map or parent_idx == -1:
-                    root_idx = node_idx
-                    break
-            if root_idx is None:
+                if parent_idx not in tree_nodes_set or parent_idx == -1 or parent_idx == node_idx:
+                    root_candidates.append(node_idx)
+            
+            if len(root_candidates) > 0:
+                root_idx = root_candidates[0]
+            else:
+                # Fallback: use middle node
                 root_idx = tree_nodes[len(tree_nodes) // 2]
         
         # Bottom-up traversal
@@ -114,16 +126,24 @@ class TreeLSTM(nn.Module):
         cell_states = {}
         
         def compute_node(node_idx):
+            # Check if node_idx is valid
+            if node_idx not in tree_nodes_set:
+                # Return zero states for invalid nodes
+                zero_h = torch.zeros(self.hidden_dim, device=node_features.device)
+                zero_c = torch.zeros(self.hidden_dim, device=node_features.device)
+                return zero_h, zero_c
+            
             if node_idx in hidden_states:
                 return hidden_states[node_idx], cell_states[node_idx]
             
             # Recursively compute children first
             child_h = []
             child_c = []
-            for child_idx in children[node_idx]:
-                c_h, c_c = compute_node(child_idx)
-                child_h.append(c_h)
-                child_c.append(c_c)
+            if node_idx in children:
+                for child_idx in children[node_idx]:
+                    c_h, c_c = compute_node(child_idx)
+                    child_h.append(c_h)
+                    child_c.append(c_c)
             
             # Compute this node
             x = node_features[node_map[node_idx]]
